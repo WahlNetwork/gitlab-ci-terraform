@@ -1,0 +1,152 @@
+# Workflow image
+image:
+  name: hashicorp/terraform:0.13.2
+  entrypoint:
+    - "/usr/bin/env"
+    - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Workflow variables
+variables:
+  # Provides a filename for the Terraform plan file
+  PLAN: plan.tfplan
+  # Provides a filename for the GitLab plan report attached to the merge request
+  JSON_PLAN_FILE: tfplan.json
+  # Provides a clue to Terraform that it is being run in a CI pipeline
+  TF_IN_AUTOMATION: "true"
+  # Environment Name (defaults to "prod")
+  ENVIRONMENT_NAME: "prod"
+
+# Cache files between jobs
+cache:
+  key: "$CI_COMMIT_SHA"
+  # Globally caches the .terraform folder across each job in this workflow
+  paths:
+    - .terraform
+
+# Provides the Terraform version and reconfigures the backend state during init
+# Note: The leading dot (.) ignores this as a "job" while the ampersand (&) is an Anchor declaring the script as a variable to use elsewhere
+.terraform-ver-init: &terraform-ver-init
+  - terraform version
+  # Provides git the ability to access other private projects for use as remote Terraform modules
+  - terraform init -backend-config="token=$TFE_TOKEN"
+
+# Provides a list of stages for this GitLab workflow
+stages:
+  - validate
+  - plan
+  - apply
+
+# Job: Validate | Stage: Validate
+# Purpose: Validate the Terraform configuration files and check the format (fmt) as a sort of linting test
+validate:
+  stage: validate
+  before_script:
+    - *terraform-ver-init
+  script:
+    - terraform validate
+    # Job will fail with exit code 3 if formatting changes are required
+    - terraform fmt -list=true -write=false -diff=true -check=true -recursive
+  only:
+    changes:
+      - "*.tf"
+      - "**/*.tf"
+
+# Job: Checkov | Stage: Validate
+# Purpose: Validate the Terraform configuration by applying security policies provided by Checkov
+checkov:
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  stage: validate
+  script:
+    - checkov -d .
+  allow_failure: true
+
+# Job: tflint | Stage: Validate
+# Purpose: Lint the Terraform configuration using tflint (only works with Terraform 0.12 code)
+tflint:
+  image:
+    name: wata727/tflint:latest
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  stage: validate
+  script:
+    - tflint -v
+    - tflint
+  allow_failure: true
+
+# Job: Test Plan | Stage: Plan
+# Purpose: Show the proposed changes included in the merge request and include details in a comment
+test plan:
+  stage: plan
+  before_script:
+    - *terraform-ver-init
+  script:
+    - apk add --update jq
+    - alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+    - terraform plan -out=$PLAN -input=false -var="email-address=$EMAIL_ADDRESS" -var="notification-threshold=$NOTIFICATION_THRESHOLD" -var="budget-amount=$BUDGET_AMOUNT"
+    - "terraform show -json $PLAN | convert_report > $JSON_PLAN_FILE"
+  artifacts:
+    name: plan
+    paths:
+      - $PLAN
+    reports:
+      terraform: $JSON_PLAN_FILE
+    expire_in: 7 days
+  only:
+    - merge_request
+
+# Job: Final Plan | Stage: Plan
+# Purpose: Capture the new Terraform configuration settings in main branch as a plan file
+final plan:
+  stage: plan
+  before_script:
+    - *terraform-ver-init
+  script:
+    - terraform plan -out=$PLAN -input=false -var="email-address=$EMAIL_ADDRESS" -var="notification-threshold=$NOTIFICATION_THRESHOLD" -var="budget-amount=$BUDGET_AMOUNT"
+  artifacts:
+    name: plan
+    paths:
+      - $PLAN
+    expire_in: 7 days
+  only:
+    - main
+  # This ensures that only one instance of this job can run in case multiple workflows are launched in parallel
+  resource_group: $ENVIRONMENT_NAME
+
+# Job: Apply | Stage: Apply
+# Purpose: Apply the new Terraform configuration settings found in the plan file
+apply:
+  stage: apply
+  before_script:
+    - *terraform-ver-init
+  environment:
+    name: $ENVIRONMENT_NAME
+    on_stop: destroy
+  script:
+    - terraform apply -input=false -auto-approve $PLAN
+  dependencies:
+    - final plan
+  only:
+    - main
+  # This ensures that only one instance of this job can run in case multiple workflows are launched in parallel
+  resource_group: $ENVIRONMENT_NAME
+
+# Job: Destroy | Stage: Apply
+# Purpose: Stop and destroy the resources configured by Terraform
+destroy:
+  stage: apply
+  before_script:
+    - *terraform-ver-init
+  script:
+    - terraform destroy -auto-approve -var="email-address=$EMAIL_ADDRESS" -var="notification-threshold=$NOTIFICATION_THRESHOLD" -var="budget-amount=$BUDGET_AMOUNT"
+  when: manual
+  only:
+    - main
+  environment:
+    name: $ENVIRONMENT_NAME
+    action: stop
+  retry: 2
