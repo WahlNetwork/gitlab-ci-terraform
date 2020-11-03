@@ -2,7 +2,7 @@
 
 This repo contains source code featured in the [Getting Started with Continuous Integration](https://youtu.be/vWIkzWJa9NU) video.
 
-- Terraform code will configure AWS Billing to provide a monthly budget of \$500 USD based.
+- Terraform code will configure AWS Billing to provide a monthly budget of \$500 USD.
 - GitLab CI configuration file, [`.gitlab-ci.yml`](.gitlab-ci.yml), will perform validation, plan, and apply stages.
 - Variables can be inserted using GitLab group / project variables for CI.
 
